@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft (rev 4) |
+| Status | Draft (rev 5) |
 | Author | aneesh-aparajit |
 | Last updated | 2026-09-27 |
 
@@ -163,37 +163,43 @@ type Handler interface {
 
 ## 6. Design
 
-### 6.1 Data model (SQLite for v1)
+### 6.1 Data model (Postgres)
 
 ```sql
 CREATE TABLE schedules (
   id              TEXT PRIMARY KEY,          -- sch_...
   handler         TEXT NOT NULL,
-  payload         BLOB,
+  payload         JSONB,
   cron            TEXT NOT NULL,
   timezone        TEXT NOT NULL DEFAULT 'UTC',
-  status          TEXT NOT NULL,             -- ACTIVE | PAUSED | CANCELLED
-  timeout_ms      INTEGER NOT NULL,          -- mandatory: a hung task would stall the schedule
-  misfire_policy  TEXT NOT NULL DEFAULT 'fire_once',
-  next_run_at     TIMESTAMP,
-  created_at      TIMESTAMP NOT NULL,
-  updated_at      TIMESTAMP NOT NULL
+  status          TEXT NOT NULL
+                  CHECK (status IN ('ACTIVE', 'PAUSED', 'CANCELLED')),
+  timeout_ms      BIGINT NOT NULL,           -- mandatory: a hung task would stall the schedule
+  misfire_policy  TEXT NOT NULL DEFAULT 'fire_once'
+                  CHECK (misfire_policy IN ('fire_once', 'fire_all', 'skip')),
+  next_run_at     TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL,
+  updated_at      TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE tasks (
   id           TEXT PRIMARY KEY,             -- tsk_...
   schedule_id  TEXT REFERENCES schedules(id),-- NULL for ONCE
-  run_type     TEXT NOT NULL,                -- ONCE | SCHEDULE
+  run_type     TEXT NOT NULL CHECK (run_type IN ('ONCE', 'SCHEDULE')),
   handler      TEXT NOT NULL,
-  payload      BLOB,
-  run_at       TIMESTAMP NOT NULL,           -- the intended fire time, never modified
-  status       TEXT NOT NULL,
+  payload      JSONB,
+  run_at       TIMESTAMPTZ NOT NULL,         -- the intended fire time, never modified
+  status       TEXT NOT NULL CHECK (status IN
+                 ('SCHEDULED', 'QUEUED', 'RUNNING',
+                  'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT')),
+  timeout_ms   BIGINT NOT NULL,
   attempts     INTEGER NOT NULL DEFAULT 0,
   output       TEXT,
   error        TEXT,
-  created_at   TIMESTAMP NOT NULL,
-  started_at   TIMESTAMP,
-  finished_at  TIMESTAMP
+  created_at   TIMESTAMPTZ NOT NULL,
+  started_at   TIMESTAMPTZ,
+  finished_at  TIMESTAMPTZ,
+  CHECK ((run_type = 'ONCE') = (schedule_id IS NULL))
 );
 
 -- Idempotent fire: a schedule can never have two tasks for the same fire time.
@@ -207,6 +213,18 @@ CREATE UNIQUE INDEX uq_tasks_schedule_active ON tasks(schedule_id)
 
 CREATE INDEX ix_tasks_pending ON tasks(status, run_at);
 ```
+
+Type choices:
+
+- **`TIMESTAMPTZ`, never `TIMESTAMP`.** It stores an absolute instant. Plain
+  `TIMESTAMP` drops the offset, which breaks the time-zone and DST handling in §7.4.
+- **`TEXT` + `CHECK` instead of Postgres `ENUM` types.** An enum value can be added
+  but never removed or renamed without recreating the type, while a `CHECK` is one
+  `ALTER TABLE`. The allowed values mirror the Go constants in `internal/core/types.go`.
+- **`JSONB` for payloads,** so they can be queried and validated when needed.
+- **Every timestamp is written by the application**, from the injected `Clock`. The
+  schema has no `DEFAULT now()`, because the fake clock in tests would disagree with
+  the database clock.
 
 The **database is the source of truth**. The PQ is only an in-memory index of
 upcoming work, and it can always be rebuilt from `tasks WHERE status = 'SCHEDULED'`.
@@ -271,17 +289,22 @@ task, and it would silently stop. So **every** terminal transition goes through 
 single function that marks the task terminal and reschedules it, in one transaction:
 
 ```sql
-BEGIN IMMEDIATE
-  UPDATE tasks SET status = :to, output, error, finished_at = now
-   WHERE id = :task_id AND status IN (:from);           -- CAS; zero rows: someone else won, stop
+BEGIN                                                    -- READ COMMITTED (default)
+  SELECT schedule_id, run_at FROM tasks WHERE id = :task_id;   -- plain read, no lock
 
-  IF task.schedule_id IS NOT NULL:
-    SELECT status, cron, timezone, misfire_policy FROM schedules WHERE id = :schedule_id;
-    IF schedule.status = 'ACTIVE':                       -- PAUSED / CANCELLED: do not reschedule
-       next := NextFireTime(schedule, task.run_at, now)  -- see §7.4
-       INSERT INTO tasks (... run_at = next, status = 'SCHEDULED')
-         ON CONFLICT DO NOTHING;                         -- idempotent
-       UPDATE schedules SET next_run_at = next WHERE id = :schedule_id;
+  IF schedule_id IS NOT NULL:
+    -- Lock the schedule FIRST (lock ordering, §6.7). Cancel/pause/resume wait here.
+    SELECT status, cron, timezone, misfire_policy FROM schedules
+     WHERE id = :schedule_id FOR UPDATE;
+
+  UPDATE tasks SET status = :to, output, error, finished_at = :now
+   WHERE id = :task_id AND status = ANY(:from);        -- CAS; zero rows: someone else won, stop
+
+  IF schedule.status = 'ACTIVE':                       -- PAUSED / CANCELLED: do not reschedule
+     next := NextFireTime(schedule, task.run_at, now)  -- see §7.4
+     INSERT INTO tasks (... run_at = next, status = 'SCHEDULED')
+       ON CONFLICT DO NOTHING;                         -- zero rows: already rescheduled
+     UPDATE schedules SET next_run_at = next WHERE id = :schedule_id;
 COMMIT
 push(next entry) onto the PQ
 ```
@@ -305,8 +328,9 @@ Notes:
 ### 6.4 Cancelling a schedule
 
 ```sql
-BEGIN IMMEDIATE
-  UPDATE schedules SET status = 'CANCELLED' WHERE id = :id AND status != 'CANCELLED';
+BEGIN
+  UPDATE schedules SET status = 'CANCELLED'                 -- takes the schedule's row lock
+   WHERE id = :id AND status != 'CANCELLED';
   UPDATE tasks SET status = 'CANCELLED'
    WHERE schedule_id = :id AND status IN ('SCHEDULED', 'QUEUED');
 COMMIT
@@ -321,13 +345,15 @@ the schedule is `CANCELLED` and stops there.
 
 **Race: cancel vs finalize.** `finalize` reads the schedule's status and inserts
 the next task. If a cancel commits between that read and the insert, the result is
-an orphaned `SCHEDULED` task. The two transactions must therefore serialize
-against each other:
+an orphaned `SCHEDULED` task. Both transactions therefore take the **schedule's
+row lock** before doing anything else. `finalize` uses `SELECT … FOR UPDATE`, and
+cancel's `UPDATE schedules` takes the same lock implicitly. Whichever comes second
+waits:
 
-- **SQLite:** start both with `BEGIN IMMEDIATE`, which takes the write lock up front.
-  SQLite allows a single writer, so the two can't interleave.
-- **Postgres (later):** use `SELECT ... FROM schedules WHERE id = ? FOR UPDATE` in
-  both transactions.
+- **Cancel first:** `finalize` unblocks, reads `CANCELLED`, and doesn't reschedule.
+- **`finalize` first:** it commits the next task. Cancel's `UPDATE tasks` is a new
+  statement, so under `READ COMMITTED` it sees that freshly committed row and
+  cancels it too.
 
 Pause is the same as cancel, except the schedule goes to `PAUSED`. Resume sets it
 back to `ACTIVE` and inserts a fresh task with `run_at = Next(now)`. If a task was
@@ -374,6 +400,37 @@ Exactly-once *effect* is possible only when handlers are **idempotent**, e.g. th
 use `task_id` as an idempotency key for external writes. At-least-once delivery
 plus idempotent handlers is what real systems use in practice. Orbit exposes
 `task_id` to handlers through `ctx` for this purpose.
+
+### 6.7 Postgres concurrency notes
+
+All transactions run at the default **`READ COMMITTED`** isolation level, and
+correctness comes from CAS updates plus explicit row locks rather than from
+`SERIALIZABLE`.
+
+1. **CAS is safe under concurrency.** When two transactions `UPDATE` the same row,
+   the second one waits for the first to commit and then **re-checks its `WHERE`
+   clause against the new row**. So `WHERE status = 'SCHEDULED'` can't match a row
+   that another transaction just moved to `CANCELLED`, and `RowsAffected()` tells
+   the caller who won.
+2. **Lock ordering: schedule row, then task rows.** Every transaction that touches
+   both tables locks the schedule first. `finalize`, cancel, pause and resume all
+   follow this order. The opposite order in one code path would allow deadlocks.
+3. **Never let an expected constraint violation abort the transaction.** In
+   Postgres, any error inside a transaction puts it into an aborted state, and
+   every later statement fails until rollback. If `finalize`'s insert hit
+   `unique_violation` (23505), the terminal status update in the same transaction
+   would be lost too. So expected conflicts use `INSERT … ON CONFLICT DO NOTHING`
+   and check the number of affected rows. They never catch 23505.
+4. **Retry on `deadlock_detected` (40P01) and `serialization_failure` (40001).**
+   These shouldn't happen given rule 2, but the transaction runner retries a few
+   times with jitter anyway. Retrying is safe because every step is a CAS or an
+   idempotent insert.
+5. **Keep transactions short.** A row lock is held until commit, so never run a
+   handler, do network I/O or wait on a channel inside a transaction.
+6. **Looking ahead: multiple nodes.** Postgres is also what makes multiple Orbit
+   instances possible later (a non-goal for now). The in-memory heap would give way
+   to polling with `SELECT … FOR UPDATE SKIP LOCKED`. The CAS transitions, lock
+   ordering and `finalize` would stay the same.
 
 ## 7. Cron expressions
 
@@ -478,7 +535,7 @@ GET    /healthz
 
 | ID | Requirement |
 |---|---|
-| NFR-1 | Single binary. Standard library plus a SQLite driver (`modernc.org/sqlite` avoids cgo). |
+| NFR-1 | Single binary. Standard library plus `github.com/jackc/pgx/v5` (`pgxpool`) for Postgres. A `docker-compose.yml` runs Postgres locally. Schema changes are versioned SQL migrations. |
 | NFR-2 | Every status transition is a CAS `UPDATE ... WHERE status = ?`, and code checks the number of affected rows. |
 | NFR-3 | `go test -race` passes. The heap is owned by the dispatcher goroutine and is not shared. |
 | NFR-4 | Graceful shutdown: stop accepting jobs, let `RUNNING` tasks finish within a grace period, then cancel their contexts. `QUEUED` tasks go back to `SCHEDULED`. |
@@ -490,7 +547,7 @@ GET    /healthz
 
 | Phase | Scope |
 |---|---|
-| **1: MVP** | `POST /jobs` with `ONCE` and no delay, `GET /tasks/{id}`, SQLite `tasks` table, worker pool, `print`/`sleep` handlers. |
+| **1: MVP** | `POST /jobs` with `ONCE` and no delay, `GET /tasks/{id}`, Postgres `tasks` table, worker pool, `print`/`sleep` handlers. |
 | **2: Delays** | `delay`, PQ and dispatcher, CAS claim, cancelling a single task, startup recovery. |
 | **3: Cron** | Parser and `Next`, `SCHEDULE` run type, `schedules` table, `finalize` with rescheduling, cancel/pause/resume. |
 | **4: Semantics** | Time zones and DST, misfire policies, retries with backoff (`max_attempts`). |
@@ -514,7 +571,7 @@ orbit/
 ├── main.go
 ├── internal/
 │   ├── api/          # HTTP handlers
-│   ├── store/        # schedules/tasks repository, SQLite impl, CAS helpers
+│   ├── store/        # schedules/tasks repository, Postgres impl, CAS helpers
 │   ├── scheduler/    # PQ, dispatcher, worker pool, recovery, clock
 │   ├── cron/         # parser + Next
 │   └── handler/      # Handler interface, registry, print/sleep
