@@ -1,0 +1,23 @@
+name: orbit
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      - POSTGRES_USERNAME=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=orbit
+    networks:
+      - app_network
+  orbit-backend:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "1337:1337"
+    depends_on:
+      - postgres
+
+networks:
+  app_network:
+    driver: bridge
