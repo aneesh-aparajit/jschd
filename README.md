@@ -1,2 +1,2 @@
-# orbit
-a light weight job scheduler.
+# jschd
+> a light weight job scheduler.
