@@ -11,7 +11,7 @@ import (
 
 	"github.com/spf13/viper"
 
-	"github.com/aneesh-aparajit/orbit/internal/logger"
+	"github.com/aneesh-aparajit/jschd/internal/logger"
 )
 
 // DefaultPath is used when no -config flag is given.

@@ -7,8 +7,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/aneesh-aparajit/orbit/internal/config"
-	"github.com/aneesh-aparajit/orbit/internal/logger"
+	"github.com/aneesh-aparajit/jschd/internal/config"
+	"github.com/aneesh-aparajit/jschd/internal/logger"
 )
 
 func main() {

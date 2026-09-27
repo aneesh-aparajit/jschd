@@ -1,4 +1,4 @@
-module github.com/aneesh-aparajit/orbit
+module github.com/aneesh-aparajit/jschd
 
 go 1.25.5
 
