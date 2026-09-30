@@ -4,8 +4,8 @@
 |---|---|
 | Status | Draft |
 | Author | aneesh-aparajit |
-| Last updated | 2026-09-27 |
-| Related | [job-scheduler.md](job-scheduler.md): functional requirements, data model, task lifecycle |
+| Last updated | 2026-10-01 |
+| Related | [job-scheduler.md](job-scheduler.md): functional requirements, data model, task lifecycle · [memory-optimizations.md](memory-optimizations.md): memory and storage work |
 
 ## 1. Purpose
 
@@ -85,7 +85,7 @@ adapters in their own packages.
    │                               CORE                                    │
    │                                                                       │
    │  Service (submit / get / cancel / pause / resume)                     │
-   │  Dispatcher (min-heap + timer loop)     Worker pool                   │
+   │  Dispatcher (read-ahead heap+timer)     Worker pool                   │
    │  Task & Schedule state machines         Misfire policy (NextFireTime) │
    │                                                                       │
    │  uses ─► cron (pure library)                                          │
@@ -103,7 +103,7 @@ adapters in their own packages.
 |---|---|---|
 | Task/Schedule types, statuses, allowed transitions | Core | `internal/core` |
 | `Service`: submit, get, cancel, pause, resume | Core (implements the driving port) | `internal/core` |
-| Dispatcher, heap, worker pool, startup recovery | Core | `internal/core` |
+| Dispatcher, read-ahead heap and refill, worker pool, startup recovery | Core | `internal/core` |
 | `finalize`, cancel/pause/resume orchestration | Core, run inside a unit of work | `internal/core` |
 | `NextFireTime` (cron + misfire policy) | Core | `internal/core` |
 | Cron parser and `Next` | Pure library, used by the core; no port needed | `internal/cron` |
@@ -199,12 +199,25 @@ type TaskStore interface {
     ListBySchedule(ctx context.Context, scheduleID string, f TaskFilter) ([]Task, error)
     ListByStatus(ctx context.Context, statuses ...TaskStatus) ([]Task, error)
 
+    // ListDue returns SCHEDULED tasks with run_at < until, ordered by run_at, at
+    // most limit of them. It is the dispatcher's read-ahead refill
+    // (job-scheduler.md §6.2.1), so it returns only what the heap needs, never
+    // the payload.
+    ListDue(ctx context.Context, until time.Time, limit int) ([]DueTask, error)
+
     // Transition is the CAS primitive: it updates the task to `to` only if it is
     // currently in one of `from`. ok=false means another actor got there first.
     Transition(ctx context.Context, id string, from []TaskStatus, to TaskStatus, u TaskUpdate) (ok bool, err error)
 
     // CancelPending moves the schedule's SCHEDULED/QUEUED tasks to CANCELLED.
     CancelPending(ctx context.Context, scheduleID string, now time.Time) (n int, err error)
+}
+
+// DueTask is the slim projection ListDue returns: exactly what a heap entry holds.
+type DueTask struct {
+    ID         string
+    ScheduleID string // empty for ONCE
+    RunAt      time.Time
 }
 
 // TaskUpdate carries the fields that change alongside a status transition.
@@ -376,6 +389,13 @@ UPDATE tasks SET
     attempts    = attempts + CASE WHEN @inc_attempt::bool THEN 1 ELSE 0 END
 WHERE id = @id AND status = ANY(@from::text[]);
 
+-- name: ListDueTasks :many
+-- Ordered range scan on ix_tasks_pending (status, run_at): LIMIT stops it early, no sort.
+SELECT id, schedule_id, run_at FROM tasks
+WHERE status = 'SCHEDULED' AND run_at < @until
+ORDER BY run_at
+LIMIT @max_rows;
+
 -- name: InsertTask :execrows
 INSERT INTO tasks (id, schedule_id, run_type, handler, payload, run_at, status, timeout_ms, created_at)
 VALUES (@id, @schedule_id, @run_type, @handler, @payload, @run_at, @status, @timeout_ms, @created_at)
@@ -514,7 +534,7 @@ orbit/
 │   │   ├── ports.go                 # Service, TaskStore, ScheduleStore, Transactor, Clock, …
 │   │   ├── errors.go                # ErrNotFound, ErrValidation, ErrConflict, ErrDuplicate
 │   │   ├── service.go               # implements Service
-│   │   ├── dispatcher.go            # heap, timer loop, claim
+│   │   ├── dispatcher.go            # heap, timer loop, read-ahead refill, offer, claim
 │   │   ├── worker.go                # worker pool, Start → Run → Finalize
 │   │   ├── finalize.go              # finalize: terminal transition + reschedule, in WithTx
 │   │   ├── plan.go                  # NextFireTime (cron + misfire)
@@ -560,7 +580,8 @@ decode JSON → SubmitRequest ──► validate run type, handler, cron
                                   s.Schedules.Create(sch)     ─────►   INSERT schedule
                                   s.Tasks.Create(first)       ─────►   INSERT task
                                 })                            ─────► COMMIT
-                                dispatcher.Push(first)  (after commit)
+                                dispatcher.Offer(first) (after commit;
+                                  admitted only if inside the window)
 SubmitResult → 201 JSON  ◄───── return {schedule_id, next_task_id}
 ```
 
@@ -587,13 +608,45 @@ Tasks.Transition(SCHEDULED→QUEUED) ──────────────�
                                          s.Schedules.SetNextRunAt(...) ────►   UPDATE
                                        })  ────────────────────────────────► COMMIT
                                      if next != nil:
-Push(next) ◄──────────────────────── dispatcher.Push(next)
+Offer(next) ◄─────────────────────── dispatcher.Offer(next)
 ```
 
 The heap is owned by the dispatcher goroutine. Workers send `Next` entries back
 through a channel instead of touching the heap (NFR-3 in `job-scheduler.md`).
 
-### 6.3 Error mapping
+### 6.3 Read-ahead refill
+
+The dispatcher holds only the tasks due within `read_ahead`. The rules, including
+why an offer is admitted by `now + read_ahead` rather than by `loadedUntil`, are
+in `job-scheduler.md` §6.2.1. This is how they map onto the ports:
+
+```
+Dispatcher (core)                                                       postgres adapter
+─────────────────                                                       ──────────────
+select {
+case <-headTimer.C():     pop, claim (§6.2)
+case <-refillTimer.C():   ─┐   (also at startup, and when full && len(heap) < max/2)
+                           │ target := clock.Now() + readAhead
+                           │ Tasks.ListDue(target, maxLoaded) ─────────────►  SELECT id, schedule_id, run_at
+                           │   for each row not in loaded → heap.Push          … ORDER BY run_at LIMIT n
+                           │ update loadedUntil, full
+                           └ refillTimer.Reset(refillInterval)
+case e := <-offers:       admit(e) per the table in §6.2.1, else drop
+case <-ctx.Done():        return
+}
+after every case: reset headTimer to the new head's RunAt
+```
+
+- **Both timers come from the `Clock` port.** Tests drive the window with the
+  fake clock: `Advance` past a refill and assert which tasks entered the heap.
+- **`ListDue` is a plain read outside `WithTx`.** It locks nothing, and a stale
+  result is harmless because the claim's CAS decides what actually runs.
+- **The refill runs on the dispatcher goroutine.** While the query runs, the
+  dispatcher can't pop. That's fine for one node and a query that takes
+  milliseconds. If refills ever get slow, move the query to a helper goroutine
+  that sends rows back on a channel, as the workers already do.
+
+### 6.4 Error mapping
 
 The core returns typed errors, and only the HTTP adapter knows about status codes:
 
@@ -609,7 +662,7 @@ The core returns typed errors, and only the HTTP adapter knows about status code
 | Layer | Test with | What it proves |
 |---|---|---|
 | `cron` | Table tests, with `robfig/cron` as a reference to compare against | Parsing, `Next`, DOM/DOW rule, DST, leap years |
-| `core` | `memstore` + fake clock + sequential IDs | State machine, dispatcher timing, misfire policies, `finalize` from all four callers, recovery. Fast and deterministic. |
+| `core` | `memstore` + fake clock + sequential IDs | State machine, dispatcher timing, misfire policies, `finalize` from all four callers, recovery. Read-ahead window: tasks outside it stay out of the heap until a refill, the `max_loaded` cap, ties at the boundary, and an offer racing a refill. Fast and deterministic. |
 | `adapters/postgres` | A **shared contract test suite** run against both `postgres` (a real Postgres from `docker compose` or testcontainers-go) and `memstore` | Both adapters behave identically: CAS semantics, `ErrDuplicate` on the unique indexes, the one-active-task constraint, and `WithTx` rollback (an error from `fn` undoes writes to *both* stores) |
 | `adapters/http` | `httptest` + a fake `Service` | Routing, JSON shape, error → status mapping |
 | End-to-end | Real binary, real Postgres, short `@every` or seconds-field cron | Everything wired together; a handful of smoke tests |

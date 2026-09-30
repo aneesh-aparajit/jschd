@@ -2,9 +2,10 @@
 
 | | |
 |---|---|
-| Status | Draft (rev 5) |
+| Status | Draft (rev 6) |
 | Author | aneesh-aparajit |
-| Last updated | 2026-09-27 |
+| Last updated | 2026-10-01 |
+| Related | [design.md](design.md): code structure · [memory-optimizations.md](memory-optimizations.md): memory and storage work |
 
 ## 1. Overview
 
@@ -44,7 +45,8 @@ execution guarantees), not to compete with production systems.
 | **Run type** | `ONCE` or `SCHEDULE`. Decides whether a request takes a `delay` or a `cron`. |
 | **Schedule** | A recurring definition: handler + payload + cron expression. Stored in `schedules`. |
 | **Task** | One concrete execution at one point in time. Stored in `tasks`. A `ONCE` job creates exactly one task. A schedule creates one task per fire time. |
-| **PQ** | The in-memory priority queue (min-heap) of upcoming tasks, ordered by `run_at`. |
+| **PQ** | The in-memory priority queue (min-heap) of upcoming tasks, ordered by `run_at`. It holds only tasks inside the read-ahead window. |
+| **Read-ahead window** | How far ahead the dispatcher loads tasks into the PQ (`read_ahead`, default 60 s). Tasks due later stay only in the database until a refill reaches them (§6.2.1). |
 | **Claim** | The atomic database update that moves a task from `SCHEDULED` to `QUEUED`. Only a claimed task may run. |
 
 ## 5. Functional requirements
@@ -64,10 +66,12 @@ request must contain:
   expression parses and has at least one future fire time.
 - It returns `201 Created` without waiting for execution. On a validation failure
   it returns `400` with a readable error.
-- **`ONCE`:** insert one `tasks` row with `run_at = now + delay` and push it onto the PQ.
+- **`ONCE`:** insert one `tasks` row with `run_at = now + delay`, then offer it to
+  the dispatcher, which admits it to the PQ only if it falls inside the read-ahead
+  window (§6.2.1).
 - **`SCHEDULE`:** in one transaction, insert the `schedules` row and a `tasks` row
-  for the first fire time, `run_at = Next(now)`. After the commit, push the task
-  onto the PQ.
+  for the first fire time, `run_at = Next(now)`. After the commit, offer the task
+  to the dispatcher in the same way.
 
 ### FR-2 Reference IDs
 
@@ -96,7 +100,7 @@ request must contain:
 
 | Status | Meaning |
 |---|---|
-| `SCHEDULED` | Stored in the database and waiting in the PQ for `run_at`. |
+| `SCHEDULED` | Stored in the database and waiting for `run_at`. It is in the PQ once `run_at` falls inside the read-ahead window (§6.2.1). |
 | `QUEUED` | Claimed by the dispatcher; waiting for a free worker. |
 | `RUNNING` | A worker is running it. |
 | `SUCCEEDED` / `FAILED` | Terminal. The handler returned, or it errored, panicked or exceeded its execution `timeout` (`FAILED` with `error = "execution timeout"`). |
@@ -226,8 +230,9 @@ Type choices:
   schema has no `DEFAULT now()`, because the fake clock in tests would disagree with
   the database clock.
 
-The **database is the source of truth**. The PQ is only an in-memory index of
-upcoming work, and it can always be rebuilt from `tasks WHERE status = 'SCHEDULED'`.
+The **database is the source of truth**. The PQ is only an in-memory index of the
+next few seconds of work (the read-ahead window, §6.2.1), and it can always be
+rebuilt from `tasks WHERE status = 'SCHEDULED'`.
 
 ### 6.2 Priority queue
 
@@ -242,12 +247,95 @@ type pqEntry struct {
 - The heap must store `RunAt` because it orders entries by it. Everything else is
   read from the database when the entry is popped.
 - A single dispatcher goroutine sleeps on a `time.Timer` set for the head's
-  `RunAt`. It wakes when the timer fires, when a new entry becomes the head, or on
-  shutdown.
+  `RunAt`. It wakes when the timer fires, when a new entry becomes the head, when
+  the refill timer fires (§6.2.1), or on shutdown.
 - **Lazy deletion:** a cancelled task stays in the heap and is discarded when it is
   popped, because its claim fails (§6.3). Removing entries eagerly would need an
-  index map plus `heap.Remove`. That isn't worth it, because a schedule has at most
-  one pending entry, so stale entries are bounded.
+  index map plus `heap.Remove`. That isn't worth it, because the heap only holds
+  one window of work, so stale entries are bounded by the window.
+
+#### 6.2.1 Read-ahead window
+
+Loading every `SCHEDULED` task into memory doesn't scale with the backlog. A job
+due in 30 days would sit in the heap for 30 days, and startup would read the whole
+backlog before dispatching anything. Instead, the PQ holds only tasks due within
+the next `read_ahead` (the **window**). Tasks due later stay only in the database
+until the window reaches them. Memory is bounded by the window, not by the total
+number of tasks.
+
+**Dispatcher state** (owned by the dispatcher goroutine, never shared, NFR-3):
+
+| Field | Meaning |
+|---|---|
+| `heap` | The PQ entries. |
+| `loaded` | Set of task IDs currently in `heap`, so a task is never added twice. |
+| `loadedUntil` | Every `SCHEDULED` task with `run_at < loadedUntil` is either in the heap or will be offered to it (see the proof below). |
+| `full` | The last refill hit `max_loaded`, so the window is narrower than `read_ahead`. |
+
+**Refill.** Runs at startup, every `refill_interval`, and whenever the heap drops
+below `max_loaded / 2` while `full`:
+
+```
+target := clock.Now() + read_ahead          -- read the clock BEFORE the query
+rows   := SELECT id, schedule_id, run_at FROM tasks
+           WHERE status = 'SCHEDULED' AND run_at < :target
+           ORDER BY run_at
+           LIMIT :max_loaded
+for each row not in loaded: push onto heap, add to loaded
+if len(rows) < max_loaded:  loadedUntil = target;             full = false
+else:                       loadedUntil = rows[last].run_at;  full = true
+```
+
+- The query selects only the columns the heap needs. The payload is read at claim
+  time, so a large JSONB payload never enters the heap.
+- `ix_tasks_pending (status, run_at)` serves it as an ordered range scan. The
+  `LIMIT` stops the scan early and Postgres needs no sort.
+- Overdue tasks (`run_at` in the past) sort first, so misfires after downtime are
+  handled before anything else, as in §7.4.
+- Each refill re-reads from the start of the window rather than continuing from
+  `loadedUntil`. Rows already in `loaded` are skipped. This costs up to
+  `max_loaded` rows per refill, but it avoids the tie problem at the boundary:
+  several tasks can share the last row's `run_at`, and only some of them may fit
+  under the `LIMIT`. Continuing from the last row (keyset pagination) is an
+  optimization in `memory-optimizations.md`.
+
+**Offer.** After committing a new task (FR-1, `finalize` in §6.3, resume in §6.4),
+the caller *offers* it to the dispatcher through a channel. The dispatcher decides
+whether to admit it:
+
+| Dispatcher state | Admit when | Otherwise |
+|---|---|---|
+| Not `full` | `run_at < clock.Now() + read_ahead` | Drop it. A later refill loads it. |
+| `full` | `run_at < loadedUntil` (strict) | Drop it. A refill loads it once the heap drains. |
+
+**Why the rule uses `now + read_ahead` and not `loadedUntil`.** A refill's
+`SELECT` reads a snapshot taken when the statement started (`READ COMMITTED`). A
+task committed after that moment is invisible to that refill. If the offer for
+such a task arrives before the refill result is applied, a rule based on the old
+`loadedUntil` would drop it, and the refill wouldn't load it either. The task
+would stay invisible until the refill after that. With the `now + read_ahead`
+rule, no task is lost:
+
+- **Admitted:** it's in the heap. If the refill also returns it, `loaded` skips
+  the duplicate.
+- **Dropped:** then `run_at ≥ t_offer + read_ahead`, and the offer happens after
+  the commit. The first refill that covers `run_at` starts at or after
+  `run_at − read_ahead ≥ t_offer`, so it starts after the commit and its snapshot
+  sees the row. Refills run every `refill_interval`, so that refill starts no
+  later than `run_at − read_ahead + refill_interval`. The task enters the heap at
+  least `read_ahead − refill_interval` before it's due. This is why
+  `refill_interval` must be less than `read_ahead`.
+
+The claim's CAS (§6.3) is the final backstop: even if a task somehow entered the
+heap twice, only one pop could claim it.
+
+**Configuration:**
+
+| Key | Default | Notes |
+|---|---|---|
+| `dispatcher.read_ahead` | `60s` | Larger means fewer refills but more memory and more stale entries from cancellations. |
+| `dispatcher.refill_interval` | `30s` | Must be less than `read_ahead`. The gap is the safety margin for slow refill queries. |
+| `dispatcher.max_loaded` | `10000` | Hard cap on heap size. Hitting it means more work is due within the window than one node should hold. |
 
 ### 6.3 Claiming and execution
 
@@ -306,7 +394,7 @@ BEGIN                                                    -- READ COMMITTED (defa
        ON CONFLICT DO NOTHING;                         -- zero rows: already rescheduled
      UPDATE schedules SET next_run_at = next WHERE id = :schedule_id;
 COMMIT
-push(next entry) onto the PQ
+offer(next entry) to the dispatcher                      -- admitted only if inside the window (§6.2.1)
 ```
 
 Notes:
@@ -319,8 +407,9 @@ Notes:
   dispatch doesn't make the schedule drift. A run that takes longer than the
   interval means `Next(run_at)` is already in the past, and the misfire policy
   (§7.4) decides what happens.
-- **Crash between commit and push.** The next task is still in the database, and
-  the startup rebuild (§6.5) recovers it.
+- **Crash between commit and offer.** The next task is still in the database, and
+  the startup refill (§6.5) recovers it. The same holds when the dispatcher drops the
+  offer because the task is outside the window: a later refill loads it.
 - **Retries (phase 4).** A failed attempt that will be retried is not terminal. It
   goes back to `SCHEDULED` with a backoff `run_at`, and `finalize` runs only after
   the last attempt.
@@ -362,8 +451,9 @@ that case resume does nothing more, and that task's `finalize` creates the next 
 
 ### 6.5 Startup recovery
 
-1. Load `tasks WHERE status = 'SCHEDULED'` into the PQ. Tasks whose `run_at` is in
-   the past are misfires, handled by the policy in §7.4.
+1. Run the first read-ahead refill (§6.2.1). Only tasks due within the window
+   are loaded, so startup cost doesn't grow with the backlog. Tasks whose `run_at`
+   is in the past sort first and are misfires, handled by the policy in §7.4.
 2. Tasks left `QUEUED` were claimed but never started, so it is safe to set them
    back to `SCHEDULED` and requeue them.
 3. Tasks left `RUNNING` were interrupted mid-execution. This is the one case where
@@ -537,7 +627,7 @@ GET    /healthz
 |---|---|
 | NFR-1 | Single binary. Standard library plus `github.com/jackc/pgx/v5` (`pgxpool`) for Postgres. A `docker-compose.yml` runs Postgres locally. Schema changes are versioned SQL migrations. |
 | NFR-2 | Every status transition is a CAS `UPDATE ... WHERE status = ?`, and code checks the number of affected rows. |
-| NFR-3 | `go test -race` passes. The heap is owned by the dispatcher goroutine and is not shared. |
+| NFR-3 | `go test -race` passes. The heap, the `loaded` set and `loadedUntil` are owned by the dispatcher goroutine and are not shared. |
 | NFR-4 | Graceful shutdown: stop accepting jobs, let `RUNNING` tasks finish within a grace period, then cancel their contexts. `QUEUED` tasks go back to `SCHEDULED`. |
 | NFR-5 | Structured `slog` logs for every transition: `task_id`, `schedule_id`, from→to, duration. |
 | NFR-6 | `time.Now` and timers sit behind a `Clock` interface, so tests can drive the dispatcher with a fake clock. |
@@ -548,7 +638,7 @@ GET    /healthz
 | Phase | Scope |
 |---|---|
 | **1: MVP** | `POST /jobs` with `ONCE` and no delay, `GET /tasks/{id}`, Postgres `tasks` table, worker pool, `print`/`sleep` handlers. |
-| **2: Delays** | `delay`, PQ and dispatcher, CAS claim, cancelling a single task, startup recovery. |
+| **2: Delays** | `delay`, PQ and dispatcher with the read-ahead window, CAS claim, cancelling a single task, startup recovery. |
 | **3: Cron** | Parser and `Next`, `SCHEDULE` run type, `schedules` table, `finalize` with rescheduling, cancel/pause/resume. |
 | **4: Semantics** | Time zones and DST, misfire policies, retries with backoff (`max_attempts`). |
 | **5: Stretch** | External Go script handlers, a CLI client, a seconds field in cron, pruning old tasks. |
